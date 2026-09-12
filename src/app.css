@@ -26,7 +26,7 @@ time.current { padding:.05rem .4rem; background:var(--block); color:var(--on-blo
 .writing:focus-within::before { content:''; position:absolute; width:2px; background:var(--wet); opacity:.75; top:0; bottom:0; left:-1rem }
 .cm-editor { background:transparent; outline:none!important; font:400 19px/30px 'Alegreya Variable',Georgia,serif; font-variant-numeric:oldstyle-nums; color:var(--ink) }
 .cm-scroller { font:inherit!important; overflow:visible!important }
-.cm-content { padding:0!important; caret-color:var(--wet); min-height:8rem; overflow-wrap:anywhere }
+.cm-content { padding:0!important; caret-color:var(--wet)!important; min-height:8rem; overflow-wrap:anywhere }
 .cm-line { padding:0!important }
 .cm-content ::selection,.cm-content::selection,::selection { background:var(--selection); color:inherit }
 .cm-cursor { border-left-color:var(--wet)!important }
