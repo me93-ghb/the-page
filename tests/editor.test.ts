@@ -412,3 +412,53 @@ test('choosing a template on a whitespace-only page follows end-input session ru
     assert.equal(view.state.doc.toString(), '\n');
   } finally { view.destroy(); parent.remove(); }
 });
+
+test('pending photograph export and rollover recovery preserve the live document', async () => {
+  const { stagePhotograph, photographCopy, pendingEndInput } = await import('../src/lib/editor.ts');
+  const parent = document.body.appendChild(document.createElement('div'));
+  const start = '2026-09-12T08:00:00+01:00';
+  const view = createEditor(parent, 'base', 'Page', false, () => {}, { date: '2026-09-12', sessions: [{ start, previous_end: null, content: 'base' }], lastEnd: start });
+  try {
+    view.dispatch({ selection: { anchor: 4 } });
+    const pending = stagePhotograph(view, new Uint8Array([1, 2]), async () => { throw new Error('unavailable'); }, start);
+    await assert.rejects(pending.retry());
+    const before = editorSnapshot(view);
+    const copied = photographCopy(view, [{ pending, path: '2026-09-12/pending.png' }]);
+    assert.match(copied.content, /base\n!\[\]\(2026-09-12\/pending.png\)/);
+    assert.deepEqual(editorSnapshot(view), before);
+    assert.deepEqual(pending.snapshot()?.bytes, [1, 2]);
+    pending.discard();
+    assert.equal(pending.snapshot(), null);
+    assert.deepEqual(photographCopy(view, [{ pending, path: '2026-09-12/rejected.png' }]), before);
+  } finally { view.destroy(); parent.remove(); }
+  const sourceHost = document.body.appendChild(document.createElement('div'));
+  const targetHost = document.body.appendChild(document.createElement('div'));
+  const at = '2026-09-13T04:00:00+01:00';
+  const pending = { from: 4, to: 7, batch: { date: '2026-09-13', at, lastEnd: at, completed: false } };
+  const source = createEditor(sourceHost, 'basenew', 'Source', false, () => {}, { date: '2026-09-12', sessions: [{ start, previous_end: null, content: 'basenew' }], lastEnd: start, pending });
+  const target = createEditor(targetHost, '', 'Target', false, () => {}, { date: '2026-09-13', now: () => new Date(at) });
+  try {
+    const captured = pendingEndInput(source);
+    assert.ok(transferEndInput(source, target));
+    assert.equal(captured?.batch.completed, false, 'an in-flight recovery snapshot must not mutate');
+    assert.equal(editorSnapshot(source).content, 'base');
+    assert.equal(editorSnapshot(target).content, 'new');
+    assert.equal(editorSnapshot(target).sessions[0].start, at);
+    assert.equal(editorSnapshot(source).lastEnd, start);
+  } finally { source.destroy(); target.destroy(); sourceHost.remove(); targetHost.remove(); }
+});
+
+test('inline and quoted photographs render while Markdown examples remain literal', () => {
+  for (const [content, count] of [
+    ['Memory ![caption](2026-09-12/photo.png)', 1],
+    ['> ![caption](2026-09-12/photo.png)', 1],
+    ['```md\n![caption](2026-09-12/photo.png)\n```', 0],
+    ['`![caption](2026-09-12/photo.png)`', 0],
+    ['    ![caption](2026-09-12/photo.png)', 0],
+  ] as const) {
+    const parent = document.body.appendChild(document.createElement('div'));
+    const view = createEditor(parent, content, 'Page', false, () => {}, { readPhotograph: async () => 'data:image/png;base64,' });
+    try { assert.equal(parent.querySelectorAll('figure.photograph').length, count, content); }
+    finally { view.destroy(); parent.remove(); }
+  }
+});

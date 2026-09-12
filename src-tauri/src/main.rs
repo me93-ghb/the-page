@@ -6,6 +6,7 @@ use tauri::{
 };
 use tauri_plugin_dialog::DialogExt;
 use the_page::storage::{self, Journal, Page, WritingSession};
+use the_page::recovery::{RecoveryStore, PendingImage, CopyAsset, SaveResult, Draft};
 
 #[derive(Default)]
 struct Session {
@@ -14,24 +15,30 @@ struct Session {
     allow_exit: bool,
 }
 
-fn read_page(state: &mut Session, date: chrono::NaiveDate) -> Result<Option<Page>, String> {
+fn recovery(app: &tauri::AppHandle) -> Result<RecoveryStore, String> {
+    let data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let data = if app.config().identifier == "com.thepage.journal" { data.parent().ok_or("Missing Application Support folder.")?.join("The Page") } else { data };
+    Ok(RecoveryStore::new(data.join("recovery")))
+}
+
+fn read_page(state: &mut Session, date: chrono::NaiveDate, recovery: &RecoveryStore) -> Result<Option<Page>, String> {
     let Some(root) = &state.root else {
         return Ok(None);
     };
     if let Some(journal) = state.journals.get(&date) {
         return Ok(Some(journal.page()));
     }
-    let path = storage::page_path(root, date)?;
-    match Journal::open(root, date) {
+    match recovery.open(root, date) {
         Ok(journal) => {
-            let page = journal.page();
+            let page = recovery.restored(root)?.into_iter().find(|p| p.date == date.to_string()).unwrap_or_else(|| journal.page());
             state.journals.insert(date, journal);
             Ok(Some(page))
         }
         Err(error) => Ok(Some(Page {
+            id: String::new(), base: None, recovered: None, pending: Vec::new(), pending_input: None,
             sessions: Vec::new(),
             date: date.to_string(),
-            content: fs::read_to_string(path).unwrap_or_default(),
+            content: storage::page_path(root, date).and_then(|path| fs::read_to_string(path).map_err(|e| e.to_string())).unwrap_or_default(),
             created: None,
             last_end_input: None,
             label: String::new(),
@@ -41,9 +48,9 @@ fn read_page(state: &mut Session, date: chrono::NaiveDate) -> Result<Option<Page
 }
 
 #[tauri::command]
-fn open_page(
+async fn open_page(
     app: tauri::AppHandle,
-    state: tauri::State<Mutex<Session>>,
+    state: tauri::State<'_, Mutex<Session>>,
     date: Option<String>,
 ) -> Result<Option<Page>, String> {
     let mut state = state.lock().map_err(|e| e.to_string())?;
@@ -63,18 +70,18 @@ fn open_page(
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or_else(|| storage::journal_day(chrono::Local::now().fixed_offset()));
-    read_page(&mut state, date)
+    read_page(&mut state, date, &recovery(&app)?)
 }
 
 #[tauri::command]
-fn list_pages(state: tauri::State<Mutex<Session>>) -> Result<Vec<String>, String> {
+async fn list_pages(state: tauri::State<'_, Mutex<Session>>) -> Result<Vec<String>, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     let Some(root) = &state.root else { return Ok(Vec::new()); };
     Ok(storage::page_dates(root)?.iter().map(ToString::to_string).collect())
 }
 
 #[tauri::command]
-fn load_pages(state: tauri::State<Mutex<Session>>, dates: Vec<String>) -> Result<Vec<Page>, String> {
+async fn load_pages(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>, dates: Vec<String>) -> Result<Vec<Page>, String> {
     if dates.len() > 8 { return Err("History loads at most eight pages at a time.".into()); }
     let mut state = state.lock().map_err(|e| e.to_string())?;
     let mut pages = Vec::new();
@@ -82,7 +89,7 @@ fn load_pages(state: tauri::State<Mutex<Session>>, dates: Vec<String>) -> Result
         let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?;
         let root = state.root.as_ref().ok_or("Choose a journal folder first.")?;
         if storage::page_path(root, date)?.try_exists().map_err(|e| e.to_string())? {
-            if let Some(page) = read_page(&mut state, date)? { pages.push(page); }
+            if let Some(page) = read_page(&mut state, date, &recovery(&app)?)? { pages.push(page); }
         }
     }
     Ok(pages)
@@ -118,6 +125,7 @@ async fn choose_folder(app: tauri::AppHandle) -> Result<Option<Page>, String> {
     let page = read_page(
         &mut state,
         storage::journal_day(chrono::Local::now().fixed_offset()),
+        &recovery(&app)?,
     )?;
     let settings_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&settings_dir).map_err(|e| e.to_string())?;
@@ -130,40 +138,96 @@ async fn choose_folder(app: tauri::AppHandle) -> Result<Option<Page>, String> {
 }
 
 #[tauri::command]
-fn save_page(
-    state: tauri::State<Mutex<Session>>,
-    date: String,
-    sessions: Vec<WritingSession>,
-    last_end: Option<String>,
-    label: String,
-) -> Result<(), String> {
-    state
-        .lock()
-        .map_err(|e| e.to_string())?
-        .journals
-        .get_mut(&chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?)
-        .ok_or("There is no writable page.")?
-        .save_sessions(&sessions, last_end.as_deref(), &label)
+async fn recovered_pages(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>) -> Result<Vec<Page>, String> {
+    let mut state = state.lock().map_err(|e| e.to_string())?;
+    let Some(root) = state.root.clone() else { return Ok(Vec::new()); };
+    let recovery = recovery(&app)?;
+    let pages = recovery.restored(&root)?;
+    for page in &pages {
+        let date = chrono::NaiveDate::parse_from_str(&page.date, "%Y-%m-%d").map_err(|e| e.to_string())?;
+        state.journals.insert(date, recovery.open(&root, date)?);
+    }
+    Ok(pages)
 }
 
 #[tauri::command]
-fn store_photograph(state: tauri::State<Mutex<Session>>, date: String, bytes: Vec<u8>) -> Result<String, String> {
+async fn refresh_pages(state: tauri::State<'_, Mutex<Session>>, dates: Vec<String>) -> Result<Vec<Page>, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    let root = state.root.as_ref().ok_or("Choose a journal folder first.")?;
+    dates.into_iter().map(|date| {
+        let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?;
+        match Journal::open(root, date) {
+            Ok(journal) => Ok(journal.page()),
+            Err(error) => {
+                let path = storage::page_path(root, date)?;
+                let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+                Ok(Page { id: String::new(), base: Some(raw.clone()), recovered: None, pending: Vec::new(), pending_input: None,
+                    sessions: Vec::new(), date: date.to_string(), content: raw, created: None, last_end_input: None, label: String::new(), error: Some(error) })
+            }
+        }
+    }).collect()
+}
+
+#[tauri::command]
+async fn checkpoint_pages(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>, drafts: Vec<Draft>) -> Result<(), String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    let root = state.root.as_ref().ok_or("Choose a journal folder first.")?;
+    recovery(&app)?.checkpoint(root, &drafts)
+}
+
+#[tauri::command]
+async fn save_page(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>, date: String, id: String, base: Option<String>,
+    sessions: Vec<WritingSession>, last_end: Option<String>, label: String, pending: Vec<PendingImage>, pending_input: Option<serde_json::Value>,
+) -> Result<SaveResult, String> {
+    let mut state = state.lock().map_err(|e| e.to_string())?;
+    let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?;
+    let journal = state.journals.get_mut(&date).ok_or("There is no writable page.")?;
+    if journal.raw_base() != base.as_deref() || journal.page().id != id {
+        *journal = Journal::at_base(&journal.root, date, base, Some(&id))?;
+    }
+    recovery(&app)?.save_input(journal, &sessions, last_end.as_deref(), &label, &pending, pending_input)
+}
+
+#[tauri::command]
+async fn store_photograph(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>, date: String, bytes: Vec<u8>) -> Result<String, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?;
     let journal = state.journals.get(&date).ok_or("There is no writable page.")?;
-    the_page::photographs::store(&journal.root, date, &bytes)
+    recovery(&app)?.import(&journal.root, date, &bytes)
 }
 
 #[tauri::command]
-fn read_photograph(state: tauri::State<Mutex<Session>>, date: String, path: String) -> Result<String, String> {
+async fn read_photograph(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>, date: String, path: String) -> Result<String, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?;
     let root = state.root.as_ref().ok_or("Choose a journal folder first.")?;
-    the_page::photographs::read(root, date, &path)
+    recovery(&app)?.read(root, date, &path)
 }
 
 #[tauri::command]
-fn exit_now(app: tauri::AppHandle, state: tauri::State<Mutex<Session>>) {
+async fn save_copy(app: tauri::AppHandle, date: String, id: String, base: Option<String>, sessions: Vec<WritingSession>, last_end: Option<String>, label: String, assets: Vec<CopyAsset>) -> Result<bool, String> {
+    let (journal, raw) = {
+        let state = app.state::<Mutex<Session>>();
+        let state = state.lock().map_err(|e| e.to_string())?;
+        let root = state.root.as_ref().ok_or("Choose a journal folder first.")?;
+        let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?;
+        let journal = match state.journals.get(&date) {
+            Some(journal) if journal.raw_base() == base.as_deref() && journal.page().id == id => journal.clone(),
+            _ => Journal::at_base(root, date, base, Some(&id))?,
+        };
+        let raw = journal.draft(&sessions, last_end.as_deref(), &label)?;
+        (journal, raw)
+    };
+    let picker_app = app.clone();
+    let choice = tauri::async_runtime::spawn_blocking(move || picker_app.dialog().file().set_title("Save a copy").add_filter("Markdown", &["md"]).set_file_name(format!("{date}.md")).blocking_save_file()).await.map_err(|e| e.to_string())?;
+    let Some(choice) = choice else { return Ok(false); };
+    let path = choice.into_path().map_err(|e| e.to_string())?;
+    recovery(&app)?.copy(&journal, &raw, &path, &assets)?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn exit_now(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>) {
     if let Ok(mut state) = state.lock() {
         state.allow_exit = true;
     }
@@ -180,6 +244,10 @@ fn main() {
             load_pages,
             choose_folder,
             save_page,
+            checkpoint_pages,
+            recovered_pages,
+            refresh_pages,
+            save_copy,
             store_photograph,
             read_photograph,
             exit_now
@@ -198,7 +266,8 @@ fn main() {
                     &MenuItem::with_id(app, "quit", "Quit The Page", true, Some("CmdOrCtrl+Q"))?,
                 ],
             )?;
-            let file = Submenu::with_items(app, "File", true, &[&save, &reveal])?;
+            let copy = MenuItem::with_id(app, "save-copy", "Save a Copy…", true, None::<&str>)?;
+            let file = Submenu::with_items(app, "File", true, &[&save, &copy, &reveal])?;
             let edit = Submenu::with_items(
                 app,
                 "Edit",
@@ -220,6 +289,15 @@ fn main() {
                 &MenuItem::with_id(app, "next", "Next Page", true, Some("CmdOrCtrl+Alt+Down"))?,
             ])?;
             app.set_menu(Menu::with_items(app, &[&application, &file, &edit, &go])?)?;
+            #[cfg(target_os = "macos")]
+            {
+                use objc2_app_kit::{NSWorkspace, NSWorkspaceWillSleepNotification};
+                let handle = app.handle().clone();
+                let callback = block2::RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| { let _ = handle.emit("save-requested", ()); });
+                // SAFETY: the block captures only a sendable AppHandle; the observer lives for the app's lifetime.
+                let observer = unsafe { NSWorkspace::sharedWorkspace().notificationCenter().addObserverForName_object_queue_usingBlock(Some(NSWorkspaceWillSleepNotification), None, None, &callback) };
+                std::mem::forget(observer);
+            }
             Ok(())
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -233,6 +311,7 @@ fn main() {
                 let _ = app.emit("navigate-requested", event.id().as_ref());
             }
             "label" => { let _ = app.emit("label-requested", ()); }
+            "save-copy" => { let _ = app.emit("save-copy-requested", ()); }
             "save" => {
                 let _ = app.emit("save-requested", ());
             }
@@ -252,6 +331,7 @@ fn main() {
             _ => {}
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Focused(false)) { let _ = window.emit("save-requested", ()); }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.emit("exit-requested", ());
@@ -272,4 +352,35 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod recovery_boundary_tests {
+    use super::*;
+    #[test]
+    fn rejected_symlinks_do_not_read_outside_journal_but_malformed_pages_remain_visible() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap(); let outside = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(outside.path().join("recovery"));
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 12).unwrap();
+        let mut state = Session { root: Some(root.path().into()), ..Default::default() };
+        fs::write(outside.path().join("secret"), "private outside content").unwrap();
+        fs::create_dir(root.path().join("2026")).unwrap();
+        let path = root.path().join("2026/2026-09-12.md");
+        symlink(outside.path().join("secret"), &path).unwrap();
+        let page = read_page(&mut state, date, &recovery);
+        assert!(page.is_err() || page.unwrap().unwrap().content.is_empty());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(root.path().join("2026")).unwrap();
+        symlink(outside.path(), root.path().join("2026")).unwrap();
+        fs::write(outside.path().join("2026-09-12.md"), "private outside content").unwrap();
+        let page = read_page(&mut state, date, &recovery);
+        assert!(page.is_err() || page.unwrap().unwrap().content.is_empty());
+        fs::remove_file(root.path().join("2026")).unwrap();
+        fs::create_dir(root.path().join("2026")).unwrap();
+        fs::write(&path, "---\ninvalid: [\n---\nlocal malformed writing").unwrap();
+        let page = read_page(&mut state, date, &recovery).unwrap().unwrap();
+        assert!(page.error.is_some());
+        assert!(page.content.contains("local malformed writing"));
+    }
 }

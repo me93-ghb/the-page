@@ -4,7 +4,7 @@ use std::{ffi::CString, fs::{File, OpenOptions}, io::{Cursor, Read, Write}, os::
 
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 
-fn format(bytes: &[u8]) -> Result<(&'static str, &'static str), String> {
+pub(crate) fn format(bytes: &[u8]) -> Result<(&'static str, &'static str), String> {
     if bytes.len() > MAX_BYTES { return Err("Photographs must be at most 32 MB.".into()); }
     let format = image::guess_format(bytes).map_err(|_| "Use a PNG or JPEG photograph.")?;
     let kind = match format {
@@ -45,25 +45,49 @@ fn year(root: &Path, date: NaiveDate, create: bool) -> Result<File, String> {
 
 pub fn store(root: &Path, date: NaiveDate, bytes: &[u8]) -> Result<String, String> {
     let (extension, _) = format(bytes)?;
-    let folder = directory(&year(root, date, true)?, &date.to_string(), true)?;
-    loop {
-        let name = format!("{}.{}", ulid::Ulid::new(), extension);
-        let c_name = CString::new(name.as_str()).unwrap();
-        // SAFETY: the directory handle and string are valid; O_EXCL forbids overwriting a collision.
-        let fd = unsafe { libc::openat(folder.as_raw_fd(), c_name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::AlreadyExists { continue; }
-            return Err(error.to_string());
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+    let path = format!("{date}/{}.{}", ulid::Ulid::new(), extension);
+    store_named(root, date, &path, bytes)?;
+    Ok(path)
+}
+
+pub(crate) fn store_named(root: &Path, date: NaiveDate, path: &str, bytes: &[u8]) -> Result<(), String> {
+    format(bytes)?;
+    let name = path.strip_prefix(&format!("{date}/")).ok_or("Invalid photograph destination.")?;
+    if name.is_empty() || name.contains(['/', '\\', ':', '\0']) || matches!(name, "." | "..") { return Err("Invalid photograph filename.".into()); }
+    let year = year(root, date, true)?;
+    let folder = directory(&year, &date.to_string(), true)?;
+    let c_name = CString::new(name).map_err(|e| e.to_string())?;
+    let temporary = CString::new(format!(".the-page-{}", ulid::Ulid::new())).unwrap();
+    // SAFETY: the directory handle and string are valid; O_EXCL forbids overwriting a collision.
+    let fd = unsafe { libc::openat(folder.as_raw_fd(), temporary.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
+    if fd < 0 { return Err(std::io::Error::last_os_error().to_string()); }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let result = (|| {
         file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
-        folder.sync_all().map_err(|e| e.to_string())?;
-        return Ok(format!("{date}/{name}"));
-    }
+        // SAFETY: both names are single components of the verified directory; never replace an existing image.
+        let renamed = unsafe { libc::renameatx_np(folder.as_raw_fd(), temporary.as_ptr(), folder.as_raw_fd(), c_name.as_ptr(), libc::RENAME_EXCL) };
+        if renamed != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists || read_bytes(root, date, path)? != bytes { return Err(error.to_string()); }
+        }
+        folder.sync_all().and_then(|_| year.sync_all()).and_then(|_| File::open(root)?.sync_all()).map_err(|e| e.to_string())
+    })();
+    // SAFETY: this is our unique temporary name, never a user image.
+    unsafe { libc::unlinkat(folder.as_raw_fd(), temporary.as_ptr(), 0); }
+    result
+
+}
+
+pub(crate) fn data_url(bytes: &[u8]) -> Result<String, String> {
+    let (_, mime) = format(bytes)?;
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
 pub fn read(root: &Path, date: NaiveDate, relative: &str) -> Result<String, String> {
+    data_url(&read_bytes(root, date, relative)?)
+}
+
+pub(crate) fn read_bytes(root: &Path, date: NaiveDate, relative: &str) -> Result<Vec<u8>, String> {
     if relative.contains([':', '\\', '\0']) || relative.starts_with('/') {
         return Err("Photographs must use a local path inside the journal.".into());
     }
@@ -82,8 +106,8 @@ pub fn read(root: &Path, date: NaiveDate, relative: &str) -> Result<String, Stri
     if !file.metadata().map_err(|e| e.to_string())?.is_file() { return Err("The photograph is not a file.".into()); }
     let mut bytes = Vec::new();
     file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    let (_, mime) = format(&bytes)?;
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+    format(&bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]

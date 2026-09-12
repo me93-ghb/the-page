@@ -5,7 +5,7 @@ use std::{
     ffi::CString,
     fs,
     io::Write,
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -25,8 +25,13 @@ pub struct WritingSession {
     pub content: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Page {
+    pub id: String,
+    pub base: Option<String>,
+    pub recovered: Option<String>,
+    pub pending: Vec<crate::recovery::PendingImage>,
+    pub pending_input: Option<serde_json::Value>,
     pub sessions: Vec<WritingSession>,
     pub date: String,
     pub content: String,
@@ -36,6 +41,7 @@ pub struct Page {
     pub error: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Journal {
     pub root: PathBuf,
     pub date: NaiveDate,
@@ -54,7 +60,7 @@ fn text(meta: &Mapping, key: &str) -> Option<String> {
 fn replace_page(
     temporary: tempfile::NamedTempFile,
     path: &Path,
-    base: Option<&str>,
+    base: Option<&[u8]>,
 ) -> Result<(), String> {
     if base.is_none() {
         temporary
@@ -79,17 +85,34 @@ fn replace_page(
         let error = std::io::Error::last_os_error();
         return Err(format!("Cannot safely replace this page: {error}"));
     }
-    // ponytail: retain predecessors, including later writes through open handles; ticket 05 owns cleanup/recovery.
-    let previous = fs::read_to_string(&displaced).map_err(|e| {
+    // Retain the displaced inode because another editor may still write through an open handle.
+    let previous = fs::read(&displaced).map_err(|e| {
         format!(
             "Cannot check the previous file at {}: {e}",
             displaced.display()
         )
     })?;
-    if Some(previous.as_str()) != base {
-        return Err(format!("This page changed during saving. The displaced version is retained at {}. Review both files before trying again.", displaced.display()));
+    if Some(previous.as_slice()) != base {
+        let conflict = conflict_copy(path, &previous)?;
+        return Err(format!("This page changed during saving. The displaced version is retained at {} (and {}). Review both files before trying again.", conflict.display(), displaced.display()));
     }
     Ok(())
+}
+
+pub(crate) fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn conflict_copy(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let copy = path.with_file_name(format!("{}.{}.conflict.md", path.file_stem().unwrap().to_string_lossy(), ulid::Ulid::new()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&copy).map_err(|e| format!("Cannot preserve a conflict copy: {e}"))?;
+    file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+    fs::File::open(path.parent().unwrap()).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+    Ok(copy)
 }
 
 pub fn page_path(root: &Path, date: NaiveDate) -> Result<PathBuf, String> {
@@ -137,8 +160,12 @@ impl Journal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.to_string()),
         };
+        Self::at_base(root, date, base, None)
+    }
+    pub fn at_base(root: &Path, date: NaiveDate, base: Option<String>, id: Option<&str>) -> Result<Self, String> {
+        if let Some(id) = id { ulid::Ulid::from_string(id).map_err(|_| "Invalid page ID.")?; }
         let mut journal = Self {
-            root: root.canonicalize().map_err(|e| e.to_string())?,
+            root: root.to_path_buf(),
             date,
             base: base.clone(),
             metadata: Mapping::new(),
@@ -177,8 +204,17 @@ impl Journal {
                 .map(|s| s.content.as_str())
                 .collect();
         }
+        if journal.base.is_none() {
+            journal.metadata.insert("id".into(), id.map(str::to_owned).unwrap_or_else(|| ulid::Ulid::new().to_string()).into());
+        }
         Ok(journal)
     }
+    pub(crate) fn recovered(root: &Path, date: NaiveDate, base: Option<String>, raw: &str) -> Result<Self, String> {
+        let mut journal = Self::at_base(root, date, Some(raw.into()), None)?;
+        journal.base = base;
+        Ok(journal)
+    }
+    pub fn raw_base(&self) -> Option<&str> { self.base.as_deref() }
     fn heading(&self, label: &str) -> String {
         let mut heading = format!("# {}", self.date.format("%A, %-d %B %Y"));
         if !label.is_empty() {
@@ -191,6 +227,8 @@ impl Journal {
     }
     pub fn page(&self) -> Page {
         Page {
+            id: text(&self.metadata, "id").unwrap(),
+            base: self.base.clone(), recovered: None, pending: Vec::new(), pending_input: None,
             sessions: self.sessions.clone(),
             date: self.date.to_string(),
             content: self.content.clone(),
@@ -201,12 +239,12 @@ impl Journal {
             error: None,
         }
     }
-    pub fn save_sessions(
-        &mut self,
+    pub fn draft(
+        &self,
         sessions: &[WritingSession],
         last_end: Option<&str>,
         label: &str,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let mut sessions = sessions.to_vec();
         while sessions.len() > 1 && sessions.last().unwrap().content.trim().is_empty() {
             sessions.pop();
@@ -234,20 +272,8 @@ impl Journal {
         if let Some(last_end) = last_end {
             DateTime::parse_from_rfc3339(last_end).map_err(|_| "Invalid end-input time.")?;
         } else if !sessions.is_empty() { return Err("Missing end-input time.".into()); }
-        let path = page_path(&self.root, self.date)?;
-        let read_current = || -> Result<Option<String>, String> {
-            match fs::read_to_string(&path) {
-                Ok(s) => Ok(Some(s)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-        if read_current()? != self.base {
-            return Err("This page changed outside The Page. Your unsaved writing remains here; the file has not been replaced.".into());
-        }
         let mut meta = self.metadata.clone();
-        if self.base.is_none() {
-            meta.insert("id".into(), ulid::Ulid::new().to_string().into());
+        if !meta.contains_key(Value::String("created".into())) {
             meta.insert("created".into(), started.into());
         }
         meta.insert("updated".into(), Local::now().to_rfc3339().into());
@@ -259,28 +285,44 @@ impl Journal {
             self.heading(label),
             blocks.join("\n\n")
         );
+        Ok(raw)
+    }
+    pub fn save_sessions(&mut self, sessions: &[WritingSession], last_end: Option<&str>, label: &str) -> Result<(), String> {
+        let raw = self.draft(sessions, last_end, label)?;
+        self.persist(&raw, &mut |_| Ok(())).map(|_| ())
+    }
+    pub(crate) fn persist(&mut self, raw: &str, fault: &mut dyn FnMut(&str) -> Result<(), String>) -> Result<Vec<PathBuf>, String> {
+        let next = Self::at_base(&self.root, self.date, Some(raw.into()), None)?;
+        let path = page_path(&self.root, self.date)?;
         let parent = path.parent().ok_or("Missing year folder.")?;
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::File::open(&self.root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
         page_path(&self.root, self.date)?;
-        let mut temporary = tempfile::Builder::new()
-            .prefix(&format!(".the-page-{}-", self.date))
-            .suffix(".md")
-            .tempfile_in(parent)
-            .map_err(|e| e.to_string())?;
-        temporary
-            .write_all(raw.as_bytes())
-            .map_err(|e| e.to_string())?;
-        temporary.as_file().sync_all().map_err(|e| e.to_string())?;
-        if read_current()? != self.base {
-            return Err("This page changed during saving. The original file is untouched.".into());
+        fault("temporary-write")?;
+        let mut temporary = tempfile::Builder::new().prefix(&format!(".the-page-{}-", self.date)).suffix(".md").tempfile_in(parent).map_err(|e| e.to_string())?;
+        temporary.write_all(raw.as_bytes()).and_then(|_| temporary.as_file().sync_all()).map_err(|e| e.to_string())?;
+        let mut conflicts = Vec::new();
+        let current = read_bytes(&path)?;
+        if current.as_deref() != self.base.as_deref().map(str::as_bytes) {
+            if let Some(bytes) = &current {
+                fault("conflict-copy")?;
+                conflicts.push(conflict_copy(&path, bytes)?);
+            }
         }
-        replace_page(temporary, &path, self.base.as_deref())?;
-        self.base = Some(raw);
-        self.metadata = meta;
-        self.content = sessions.iter().map(|s| s.content.as_str()).collect();
-        self.sessions = sessions;
-        Ok(())
+        fault("before-recheck")?;
+        let latest = read_bytes(&path)?;
+        if latest != current {
+            if let Some(bytes) = &latest { fault("conflict-copy")?; conflicts.push(conflict_copy(&path, bytes)?); }
+            return Err(format!("The page changed again while saving. Preserved copies: {}. Try again.", conflicts.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")));
+        }
+        page_path(&self.root, self.date)?;
+        fault("rename")?;
+        replace_page(temporary, &path, current.as_deref())?;
+        fs::File::open(parent).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+        *self = next;
+        Ok(conflicts)
     }
+
 }
 
 fn session_heading(start: &str, date: NaiveDate) -> Result<String, String> {
@@ -525,7 +567,7 @@ mod tests {
     }
     #[test]
     fn replacement_boundary_retains_racing_external_writes() {
-        for base in [Some("base"), None] {
+        for base in [Some(b"base".as_slice()), None] {
             let root = tempfile::tempdir().unwrap();
             let directory = root.path().canonicalize().unwrap();
             let path = directory.join("page.md");
@@ -553,7 +595,7 @@ mod tests {
         let mut external = fs::OpenOptions::new().write(true).open(&path).unwrap();
         let mut temporary = tempfile::NamedTempFile::new_in(&directory).unwrap();
         temporary.write_all(b"mine").unwrap();
-        replace_page(temporary, &path, Some("base")).unwrap();
+        replace_page(temporary, &path, Some(b"base")).unwrap();
         external.write_all(b"late external").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"mine");
         assert!(fs::read_dir(root.path())
@@ -590,15 +632,18 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_conflicting_files_are_never_replaced() {
+    fn malformed_files_are_protected_and_conflicting_bytes_are_copied() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("2026/2026-09-12.md");
         let mut journal = Journal::open(root.path(), day()).unwrap();
         journal.save_sessions(&one("mine"), Some(START), "").unwrap();
         fs::write(&path, "external writing").unwrap();
-        assert!(journal.save_sessions(&one("new mine"), Some(START), "").is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "external writing");
         assert!(Journal::open(root.path(), day()).is_err());
+        journal.save_sessions(&one("new mine"), Some(START), "").unwrap();
+        assert_eq!(Journal::open(root.path(), day()).unwrap().content(), "new mine");
+        assert!(fs::read_dir(path.parent().unwrap()).unwrap().any(|f| {
+            let f = f.unwrap(); f.file_name().to_string_lossy().ends_with(".conflict.md") && fs::read(f.path()).unwrap() == b"external writing"
+        }));
     }
     #[test]
     fn a_failed_temporary_write_keeps_the_saved_page() {

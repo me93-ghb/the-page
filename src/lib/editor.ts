@@ -8,8 +8,8 @@ import { foldTier, inputPlan, journalDay, sessionTime, timestamp } from './journ
 import type { WritingSession } from './journal';
 
 type Boundary = Omit<WritingSession, 'content'> & { from: number; fresh?: boolean };
-type Options = { date: string; sessions: WritingSession[]; lastEnd: string | null; now: () => Date; active: () => boolean; readPhotograph?: (path: string) => Promise<string>; photograph?: (file: File) => void; focusTemplates?: () => void };
-type PendingInput = { from: number; to: number; batch: { date: string; at: string; lastEnd: string; completed: boolean } };
+type Options = { date: string; sessions: WritingSession[]; lastEnd: string | null; now: () => Date; active: () => boolean; readPhotograph?: (path: string) => Promise<string>; photograph?: (file: File) => void; focusTemplates?: () => void; pending?: PendingInput | null };
+export type PendingInput = { from: number; to: number; batch: { date: string; at: string; lastEnd: string; completed: boolean } };
 export type WritingChange = { appended: boolean; pending: PendingInput | null };
 type Ownership = { boundaries: Boundary[]; pending: PendingInput | null };
 const restoreOwnership = StateEffect.define<Ownership & { transferred?: PendingInput['batch'] }>({
@@ -25,7 +25,7 @@ const writing = StateField.define<Ownership & { lastEnd: string | null; composit
     const options = state.facet(settings);
     let from = 0;
     const boundaries = options.sessions.map(({ content, ...session }) => { const boundary = { ...session, from }; from += content.length; return boundary; });
-    return { boundaries, pending: null, lastEnd: options.lastEnd ?? boundaries.at(-1)?.start ?? null, compositionFrom: null };
+    return { boundaries, pending: options.pending ?? null, lastEnd: options.lastEnd ?? boundaries.at(-1)?.start ?? null, compositionFrom: null };
   },
   update(value, tr) {
     const clock = tr.effects.find(effect => effect.is(endClock));
@@ -77,12 +77,14 @@ const writing = StateField.define<Ownership & { lastEnd: string | null; composit
   },
 });
 
-export function editorSnapshot(view: EditorView): { content: string; sessions: WritingSession[]; lastEnd: string | null } {
+export function editorSnapshot(view: Pick<EditorView, 'state'>): { content: string; sessions: WritingSession[]; lastEnd: string | null } {
   const content = view.state.doc.toString(), value = view.state.field(writing);
   const sessions = value.boundaries.map(({ from, fresh: _fresh, ...session }, i) => ({ ...session, content: content.slice(from, value.boundaries[i + 1]?.from) }));
   while (sessions.length > 1 && !sessions.at(-1)!.content.trim()) sessions.pop();
   return { content, sessions, lastEnd: value.lastEnd };
 }
+
+export function pendingEndInput(view: EditorView) { const pending = view.state.field(writing).pending; return pending && { ...pending, batch: { ...pending.batch } }; }
 
 export function transferEndInput(source: EditorView, target: EditorView) {
   const pending = source.state.field(writing).pending;
@@ -128,25 +130,45 @@ const imageAnchors = StateField.define<ImageAnchor[]>({
   },
 });
 
-export function stagePhotograph(view: EditorView, input: Uint8Array | Promise<Uint8Array>, store: (bytes: Uint8Array) => Promise<string>, at = timestamp(view.state.facet(settings).now())) {
+function photographChange(state: EditorState, anchor: ImageAnchor, path: string, at: string) {
+  const before = anchor.from && state.doc.sliceString(anchor.from - 1, anchor.from) !== '\n' ? '\n' : '';
+  const text = `${before}![](${path})\n`;
+  const selected = state.selection.main;
+  const unchanged = selected.from === anchor.from && selected.to === anchor.to;
+  return { changes: { from: anchor.from, to: anchor.to, insert: text },
+    ...(unchanged ? { selection: { anchor: anchor.from + text.length } } : {}),
+    effects: removeImageAnchor.of(anchor.id), userEvent: 'input.paste', annotations: [isolateHistory.of('full'), correction.of(!!anchor.corrected || !unchanged || Date.parse(state.field(writing).lastEnd ?? at) > Date.parse(at)), inputTime.of(at)], scrollIntoView: unchanged };
+}
+
+export function photographCopy(view: EditorView, photographs: { pending: PendingPhotograph; path: string }[]) {
+  let state = view.state;
+  for (const photograph of photographs) state = photograph.pending.copy(state, photograph.path);
+  return editorSnapshot({ state });
+}
+
+export type PendingImageData = { bytes: number[]; from: number; to: number; at: string; corrected: boolean };
+
+export function stagePhotograph(view: EditorView, input: Uint8Array | Promise<Uint8Array>, store: (bytes: Uint8Array) => Promise<string>, at = timestamp(view.state.facet(settings).now()), corrected = false) {
   const id = {}, selection = view.state.selection.main;
-  view.dispatch({ effects: imageAnchor.of({ id, from: selection.from, to: selection.to }) });
+  view.dispatch({ effects: imageAnchor.of({ id, from: selection.from, to: selection.to, corrected }) });
   let running: Promise<void> | undefined, completed = false;
   let bytes = input instanceof Uint8Array ? input : null;
-  return { get bytes() { return bytes; }, retry(): Promise<void> {
+  return { get bytes() { return bytes; }, discard() {
+    view.dispatch({ effects: removeImageAnchor.of(id) }); completed = true; bytes = null;
+  }, snapshot(): PendingImageData | null {
+    const anchor = view.state.field(imageAnchors).find(anchor => anchor.id === id);
+    return bytes && anchor ? { bytes: Array.from(bytes), from: anchor.from, to: anchor.to, at, corrected: !!anchor.corrected } : null;
+  }, copy(state: EditorState, path: string) {
+    const anchor = state.field(imageAnchors).find(anchor => anchor.id === id);
+    return anchor ? state.update(photographChange(state, anchor, path, at)).state : state;
+  }, retry(): Promise<void> {
     if (completed) return Promise.resolve();
     if (running) return running;
     running = (async () => {
       bytes ??= await input;
       const path = await store(bytes);
       const anchor = view.state.field(imageAnchors).find(anchor => anchor.id === id)!;
-      const before = anchor.from && view.state.doc.sliceString(anchor.from - 1, anchor.from) !== '\n' ? '\n' : '';
-      const text = `${before}![](${path})\n`;
-      const selected = view.state.selection.main;
-      const unchanged = selected.from === anchor.from && selected.to === anchor.to;
-      view.dispatch({ changes: { from: anchor.from, to: anchor.to, insert: text },
-        ...(unchanged ? { selection: { anchor: anchor.from + text.length } } : {}),
-        effects: removeImageAnchor.of(id), userEvent: 'input.paste', annotations: [isolateHistory.of('full'), correction.of(!!anchor.corrected || !unchanged || Date.parse(editorSnapshot(view).lastEnd ?? at) > Date.parse(at)), inputTime.of(at)], scrollIntoView: unchanged });
+      view.dispatch(photographChange(view.state, anchor, path, at));
       completed = true;
     })().finally(() => { running = undefined; });
     return running;
@@ -315,7 +337,7 @@ export function createEditor(parent: HTMLElement, content: string, label: string
   const initial = options.sessions ?? (content ? [{ start: timestamp(now()), previous_end: null, content }] : []);
   return new EditorView({ parent, state: EditorState.create({
     doc: content,
-    extensions: [settings.of({ date: options.date ?? journalDay(now()), sessions: initial, lastEnd: options.lastEnd ?? null, active: options.active ?? (() => true), now, readPhotograph: options.readPhotograph, photograph: options.photograph }),
+    extensions: [settings.of({ date: options.date ?? journalDay(now()), sessions: initial, lastEnd: options.lastEnd ?? null, active: options.active ?? (() => true), now, readPhotograph: options.readPhotograph, photograph: options.photograph, pending: options.pending }),
       markdown(), history(), writing, imageAnchors, decorations, EditorView.lineWrapping,
       invertedEffects.of(tr => {
         if (!tr.docChanged) return [];

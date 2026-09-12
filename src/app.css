@@ -59,7 +59,7 @@ button:focus-visible { outline:2px solid var(--wet); outline-offset:2px }
 .close-dialog { max-width:34rem; border:0; padding:2rem; color:var(--ink); background:var(--paper) }
 .close-dialog h2 { font-size:24px; font-weight:400 }
 .close-dialog p { font-size:19px; line-height:1.6 }
-.fold { position:relative; width:100cqw; margin-left:calc((100% - 100cqw) / 2); height:var(--fold-height); user-select:none; -webkit-user-select:none; pointer-events:none }
+.fold { clear:both; position:relative; width:100cqw; margin-left:calc((100% - 100cqw) / 2); height:var(--fold-height); user-select:none; -webkit-user-select:none; pointer-events:none }
 .fold::before { content:''; position:absolute; top:50%; inset-inline:0; height:2px; background:linear-gradient(var(--crease-hi) 0 50%,var(--crease-sh) 50%) }
 .fold::after { content:''; position:absolute; top:calc(50% + 2px); inset-inline:0; height:calc(6px + 12px * var(--depth)); background:linear-gradient(rgb(var(--fold-glow) / calc(var(--glow-alpha) * var(--depth))),transparent) }
 .archive time,.fold time { padding:.05rem .4rem; background-color:var(--paper); color:var(--ink-2); transition:background-color 600ms linear,color 600ms linear }
@@ -76,6 +76,8 @@ button:focus-visible { outline:2px solid var(--wet); outline-offset:2px }
 }
 @container app (min-width:920px) {
   .archive { position:absolute; right:calc(100% + 1.75rem); width:8.5rem; text-align:right; display:flex; align-items:flex-end; flex-direction:column; gap:.45rem; margin:0 }
+  /* A zero-width float lets writing start beside the archive while folds clear its full height. */
+  .cm-content::before { content:''; float:left; width:0; height:var(--archive-height,0px) }
   .slash { display:none }
   .fold time { left:calc((100cqw - 34rem) / 2 - 1.75rem); transform:translate(-100%,-50%) }
 }

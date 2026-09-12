@@ -4,21 +4,24 @@
   import { listen, TauriEvent } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { undo, redo } from '@codemirror/commands';
-  import { createEditor, editorSnapshot, refreshFolds, transferEndInput, templates, insertTemplate, stagePhotograph } from './lib/editor';
+  import { createEditor, editorSnapshot, refreshFolds, pendingEndInput, transferEndInput, templates, insertTemplate, stagePhotograph, photographCopy } from './lib/editor';
   import { Flow, gapNote, historyBatch, historyGap } from './lib/flow';
-  import type { PendingPhotograph } from './lib/editor';
+  import { persistPages } from './lib/persistence';
+  import type { SaveResult } from './lib/persistence';
+  import type { PendingInput, PendingImageData, PendingPhotograph } from './lib/editor';
   import { journalDay, sessionTime, inputPlan, timestamp } from './lib/journal';
   import type { WritingSession } from './lib/journal';
   import type { EditorView } from '@codemirror/view';
 
-  type Page = { date: string; content: string; sessions: WritingSession[]; created: string | null; last_end_input: string | null; label: string; error: string | null };
-  type OpenPage = Page & { dirty: boolean; revision: number; editor?: EditorView; labelEditing?: boolean; template?: typeof templates[number] };
+  type Page = { id: string; base: string | null; recovered: string | null; pending: PendingImageData[]; pending_input: PendingInput | null; date: string; content: string; sessions: WritingSession[]; created: string | null; last_end_input: string | null; label: string; error: string | null };
+  type OpenPage = Page & { dirty: boolean; revision: number; recoveredRevision?: number; editor?: EditorView; labelEditing?: boolean; template?: typeof templates[number] };
   type Transfer = { source: OpenPage; date: string; running: boolean; target?: OpenPage };
   let pages = $state<OpenPage[]>([]), activeDate = $state('');
   let closeDialog = $state<HTMLDialogElement>();
   let loading = $state(true), notice = $state(''), closing = $state(false), now = $state(new Date());
   let focused: OpenPage | undefined;
-  let pendingImages = $state.raw<PendingPhotograph[]>([]);
+  let pendingImages = $state.raw<{ page: OpenPage; pending: PendingPhotograph }[]>([]);
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let importing = 0;
   const imageReads = new Map<string, Promise<string>>();
   let transfer = $state.raw<Transfer | null>(null);
@@ -65,7 +68,7 @@
     const prepend = !!pages.length && next.some(page => page.date < pages[0].date);
     const update = async () => {
       const merged = new Map(pages.map(page => [page.date, page]));
-      for (const page of next) if (!merged.has(page.date) || merged.get(page.date)!.error) merged.set(page.date, { ...page, dirty: false, revision: 0 });
+      for (const page of next) if (!merged.has(page.date) || merged.get(page.date)!.error) merged.set(page.date, { ...page, dirty: !!page.recovered, revision: 0, recoveredRevision: page.recovered ? 0 : -1 });
       pages = [...merged.values()].sort((a, b) => a.date.localeCompare(b.date));
       await tick();
     };
@@ -137,6 +140,14 @@
     page.revision++; page.dirty = snapshot.sessions.length > 0 || !!page.label;
     if (!snapshot.content.trim()) page.template = 'Blank';
   }
+  function archiveSpace(node: HTMLElement, page: OpenPage) {
+    const resize = new ResizeObserver(() => {
+      node.parentElement!.style.setProperty('--archive-height', `${node.offsetHeight}px`);
+      page.editor?.requestMeasure();
+    });
+    resize.observe(node);
+    return { destroy() { resize.disconnect(); } };
+  }
   function attach(host: HTMLDivElement, page: OpenPage) {
     page.editor = createEditor(host, page.content, dateLabel(page), !!page.error, (_text, _appended, change) => {
       refresh(page);
@@ -146,7 +157,7 @@
         queueMicrotask(() => void finishTransfer());
       }
       clearTimeout(timer); timer = setTimeout(() => void save(), 1000);
-    }, { date: page.date, sessions: page.sessions, lastEnd: page.last_end_input,
+    }, { date: page.date, sessions: page.sessions, lastEnd: page.last_end_input, pending: page.pending_input,
       active: () => page.date === activeDate && transfer?.source !== page,
       focusTemplates: () => host.nextElementSibling?.querySelector<HTMLButtonElement>('[tabindex="0"]')?.focus(),
       photograph: file => void importPhotograph(page, file),
@@ -157,12 +168,24 @@
       } });
     const focus = () => { focused = page; };
     const compositionEnd = () => { setTimeout(() => { if (transfer?.source === page) void finishTransfer(); }, 30); };
+    for (const image of page.pending ?? []) {
+      page.editor.dispatch({ selection: { anchor: image.from, head: image.to } });
+      const pending = stagePhotograph(page.editor, new Uint8Array(image.bytes), bytes => invoke<string>('store_photograph', { date: page.date, bytes: Array.from(bytes) }), image.at, image.corrected);
+      pendingImages = [...pendingImages, { page, pending }];
+    }
+    page.pending = [];
+    if (page.pending_input) {
+      transfer = { source: page, date: page.pending_input.batch.date, running: false };
+      page.pending_input = null;
+      queueMicrotask(() => void finishTransfer());
+    }
     host.addEventListener('focusin', focus); host.addEventListener('compositionend', compositionEnd);
     return { destroy() { host.removeEventListener('focusin', focus); host.removeEventListener('compositionend', compositionEnd); page.editor?.destroy(); page.editor = undefined; } };
   }
   async function importPhotograph(page: OpenPage, file: File) {
     if (page.error || !page.editor) return;
     importing++;
+    let staged: PendingPhotograph | undefined;
     try {
       if (file.size > 32 * 1024 * 1024) throw new Error('Photographs must be at most 32 MB.');
       const at = new Date(), selection = page.editor.state.selection.main;
@@ -175,19 +198,31 @@
       }
       const pending = stagePhotograph(page.editor!, file.arrayBuffer().then(buffer => new Uint8Array(buffer)),
         bytes => invoke<string>('store_photograph', { date: page.date, bytes: Array.from(bytes) }), timestamp(at));
-      pendingImages = [...pendingImages, pending];
+      staged = pending;
+      pendingImages = [...pendingImages, { page, pending }];
       await pending.retry();
-      pendingImages = pendingImages.filter(item => item !== pending);
+      pendingImages = pendingImages.filter(item => item.pending !== pending);
     } catch (error) {
-      notice = `Photograph not inserted. ${String(error)} Your writing remains here.${pendingImages.some(image => image.bytes) ? ' Pending image bytes remain in this window for retry.' : ''}`;
-    } finally { importing--; }
+      if (staged && String(error).startsWith('Unsupported photograph.')) {
+        staged.discard(); pendingImages = pendingImages.filter(item => item.pending !== staged);
+      }
+      notice = `Photograph not inserted. ${String(error)} Your writing remains here.${pendingImages.some(image => image.pending.bytes) ? ' Pending image bytes remain in this window for retry.' : ''}`;
+    } finally {
+      importing--;
+      if (pendingImages.some(item => item.page === page)) {
+        page.dirty = true; page.revision++;
+        clearTimeout(timer); timer = setTimeout(() => void save(), 1000);
+      }
+    }
   }
   async function retryImages() {
-    for (const pending of pendingImages) {
-      try { await pending.retry(); pendingImages = pendingImages.filter(item => item !== pending); }
-      catch (error) { notice = `Photograph not inserted. ${String(error)} Pending bytes remain in this window.`; return; }
+    for (const { page, pending } of pendingImages) {
+      try { await pending.retry(); pendingImages = pendingImages.filter(item => item.pending !== pending); }
+      catch (error) {
+        if (String(error).startsWith('Unsupported photograph.')) { pending.discard(); pendingImages = pendingImages.filter(item => item.pending !== pending); }
+        page.dirty = true;
+      }
     }
-    void save();
   }
   function editLabel(page = focused ?? pages.find(page => page.date === activeDate)) {
     if (!page || page.error) return;
@@ -266,7 +301,15 @@
         const next = await invoke<Page | null>('open_page');
         if (next) { activeDate = next.date; const page = await put(next); notice = page.error ?? ''; focusEnd(page); }
       }
-      if (pages.length) await indexPages();
+      if (pages.length) {
+        const restored = await invoke<Page[]>('recovered_pages');
+        await insert(restored);
+        if (restored.length) {
+          notice = `Recovered writing from ${restored.at(-1)!.recovered!.slice(11, 16)}.`;
+          clearTimeout(timer); timer = setTimeout(() => void save(), 1000);
+        }
+        await indexPages();
+      }
     } catch (error) { notice = `Cannot open the journal. ${String(error)}`; }
     finally { loading = false; }
   }
@@ -274,23 +317,69 @@
     clearTimeout(timer);
     if (saving) return saving;
     saving = (async () => {
-      while (pages.some(page => page.dirty)) {
-        if (transfer) return false;
-        const page = pages.find(page => page.dirty)!;
-        const revision = page.revision;
+      await retryImages();
+      const hadFailure = !!notice;
+      const { durable, results } = await persistPages(pages, async page => {
         try {
-          await invoke('save_page', { date: page.date, sessions: page.sessions, lastEnd: page.last_end_input, label: page.label });
-          if (page.revision === revision) page.dirty = false;
-          if (!savedDates.includes(page.date)) savedDates = [...savedDates, page.date].sort();
-          if (!pendingImages.length) notice = '';
-        } catch (error) {
-          notice = `Save not confirmed. ${String(error)} Your latest writing remains in this window. Keep it open until saving succeeds.`;
-          return false;
-        }
+          const drafts = pages.filter(page => page.dirty).map(page => ({ date: page.date, id: page.id, base: page.base, sessions: page.sessions, lastEnd: page.last_end_input, label: page.label,
+            pendingInput: page.editor ? pendingEndInput(page.editor) : page.pending_input,
+            pending: pendingImages.filter(item => item.page === page).flatMap(item => { const data = item.pending.snapshot(); return data ? [data] : []; }) }));
+          const draft = drafts.find(draft => draft.date === page.date)!;
+          // Checkpoint every dirty page before clearing a source page's recovery after rollover.
+          await invoke('checkpoint_pages', { drafts });
+          return await invoke<SaveResult>('save_page', draft);
+        } catch (error) { return { saved: false, recovered: false, base: page.base, cause: String(error), conflicts: [] }; }
+      });
+      for (const page of pages) if (!page.dirty) { page.recovered = null; if (page.base && !savedDates.includes(page.date)) savedDates = [...savedDates, page.date].sort(); }
+      const failures = results.filter(result => !result.saved), conflicts = results.flatMap(result => result.conflicts);
+      if (results.length) clearTimeout(noticeTimer);
+      if (failures.length) {
+        const memory = failures.some(result => !result.recovered);
+        notice = `Not saved. ${failures.map(result => result.cause).filter(Boolean).join(' ')} ${memory ? 'Some writing exists only in this window. Keep it open until saving succeeds.' : 'A recovery copy exists on this Mac. The Page will retry while this window is open.'}`;
+        const recovered = pages.find(page => page.recovered)?.recovered;
+        if (recovered) notice = `Recovered writing from ${recovered.slice(11, 16)}. ${notice}`;
+        if (conflicts.length) notice += ` External versions were preserved at ${conflicts.join(', ')}.`;
+      } else if (conflicts.length) notice = `Saved your writing. External versions were preserved at ${conflicts.join(', ')}.`;
+      else if (results.length && hadFailure) {
+        notice = `Saved to the journal, ${new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}.`;
+        const acknowledgement = notice;
+        noticeTimer = setTimeout(() => { if (notice === acknowledgement) notice = ''; }, 2600);
       }
-      return !transfer && !pendingImages.length && !importing;
+      return durable && !importing;
     })().finally(() => { saving = undefined; });
     return saving;
+  }
+  async function saveCopy() {
+    const page = focused ?? pages.find(page => page.date === activeDate);
+    if (!page || page.error) return;
+    try {
+      await retryImages();
+      const images = pendingImages.filter(item => item.page === page).map(item => ({ ...item, path: `${page.date}/pending-${crypto.randomUUID()}.png` }));
+      if (images.some(image => !image.pending.bytes) || importing) throw new Error('The photograph is still being read. Try again in a moment.');
+      const snapshot = photographCopy(page.editor!, images);
+      if (await invoke<boolean>('save_copy', { date: page.date, id: page.id, base: page.base, sessions: snapshot.sessions, lastEnd: snapshot.lastEnd, label: page.label,
+        assets: images.map(image => ({ path: image.path, bytes: Array.from(image.pending.bytes!) })) })) notice = 'Saved a copy. Your journal and recovery state are unchanged.';
+    } catch (error) { notice = `Cannot save a copy. ${String(error)}`; }
+  }
+  async function refreshCleanPages() {
+    const clean = pages.filter(page => !page.dirty).map(page => ({ page, revision: page.revision }));
+    if (!clean.length) return;
+    const refreshed = await invoke<Page[]>('refresh_pages', { dates: clean.map(item => item.page.date) });
+    for (const next of refreshed) {
+      const item = clean.find(item => item.page.date === next.date)!;
+      if (item.page.dirty || item.page.revision !== item.revision || item.page.base === next.base && item.page.error === next.error) continue;
+      imageReads.clear();
+      pages = pages.map(page => page === item.page ? { ...next, dirty: false, revision: 0 } : page);
+      if (focused === item.page) focused = undefined;
+    }
+    await tick();
+  }
+  async function retrySave() {
+    if (!pages.length) { await open(); return; }
+    if (transfer) await finishTransfer();
+    await save();
+    try { await refreshCleanPages(); if (!indexed) await indexPages(); }
+    catch (error) { notice = `Cannot check the journal. ${String(error)}`; }
   }
   async function requestExit() {
     if (transfer) await finishTransfer();
@@ -300,9 +389,11 @@
   async function quitWithoutRetrying() { await invoke('exit_now'); }
 
   onMount(() => {
-    const activate = () => {
+    const activate = async () => {
       if (loading || closing || !pages.length) return;
       flow?.interrupt();
+      try { await save(); await refreshCleanPages(); }
+      catch (error) { notice = `Cannot check external changes. ${String(error)}`; }
       if (journalDay(new Date()) !== activeDate) void open();
       else { const page = pages.find(page => page.date === activeDate); if (page) focusEnd(page); }
     };
@@ -313,11 +404,16 @@
       }),
       listen('label-requested', () => editLabel()),
       listen('save-requested', () => void save()),
+      listen('save-copy-requested', () => void saveCopy()),
       getCurrentWindow().listen(TauriEvent.WINDOW_FOCUS, activate),
       listen<string>('navigate-requested', event => void navigate(event.payload)),
       listen('exit-requested', () => void requestExit()),
       listen<string>('native-error', event => { notice = event.payload; }),
     ];
+    const retry = setInterval(() => { if (pages.some(page => page.dirty) || pendingImages.length) void save(); }, 30000);
+    const hidden = () => { if (document.hidden) void save(); };
+    document.addEventListener('visibilitychange', hidden);
+    window.addEventListener('blur', save);
     const clock = setInterval(() => now = new Date(), 1000);
     const keydown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 't') { event.preventDefault(); event.stopPropagation(); void navigate('today'); return; }
@@ -328,7 +424,7 @@
     };
     window.addEventListener('keydown', keydown, true);
     Promise.all(listeners).then(() => open());
-    return () => { clearInterval(clock); clearTimeout(timer); window.removeEventListener('keydown', keydown, true); listeners.forEach(p => p.then(unlisten => unlisten())); };
+    return () => { clearInterval(retry); clearTimeout(noticeTimer); document.removeEventListener('visibilitychange', hidden); window.removeEventListener('blur', save); clearInterval(clock); clearTimeout(timer); window.removeEventListener('keydown', keydown, true); listeners.forEach(p => p.then(unlisten => unlisten())); };
   });
 </script>
 
@@ -344,7 +440,7 @@
         {@const gap = i > 0 ? gapNote(pages[i - 1].date, page.date, savedDates) : ''}
         <article class="page" class:after-page={i > 0} class:after-gap={!!gap} id={`page-${page.date}`}>
           {#if gap}<p class="gap-note">{gap}</p>{/if}
-          <div class="archive" aria-label={`Page dated ${dateLabel(page)}`}>
+          <div class="archive" aria-label={`Page dated ${dateLabel(page)}`} use:archiveSpace={page}>
             <span>{dateLabel(page)}</span><span class="slash" aria-hidden="true"> / </span>
             <time class:current={!page.error && page.date === activeDate && page.sessions.length <= 1}>{timeLabel(page)}</time>
             {#if page.label}<span class="slash" aria-hidden="true"> / </span>{/if}
@@ -384,7 +480,8 @@
   {#if notice}
     <aside class="notice" role="status" aria-live="polite">
       <p>{notice}</p>
-      <button onclick={() => pendingImages.length ? retryImages() : transfer ? finishTransfer() : pages.some(page => page.dirty) ? save() : !indexed ? indexPages() : open()} disabled={loading}>Try again</button>
+      <button onclick={retrySave} disabled={loading}>Try again</button>
+      {#if pages.length}<button onclick={saveCopy}>Save a copy…</button>{/if}
       {#if !pages.length}<button onclick={() => open(true)} disabled={loading}>Choose folder…</button>{/if}
     </aside>
   {/if}
