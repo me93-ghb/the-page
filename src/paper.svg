@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" viewBox="0 0 800 800">
+<style>.dark-mottle{display:none}@media(prefers-color-scheme:dark){.light-mottle{display:none}.dark-mottle{display:inline}}</style>
+<defs>
+<filter id="mottle"><feTurbulence type="fractalNoise" baseFrequency=".005" numOctaves="4" seed="8"/><feColorMatrix type="matrix" values="0 0 0 0 .42 0 0 0 0 .31 0 0 0 0 .17 0 0 0 .08 0"/></filter>
+<filter id="dark-mottle"><feTurbulence type="fractalNoise" baseFrequency=".005" numOctaves="4" seed="8"/><feColorMatrix type="matrix" values="0 0 0 0 1 0 0 0 0 .97 0 0 0 0 .9 0 0 0 .06 0"/></filter>
+<filter id="tooth"><feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" seed="12"/><feColorMatrix type="matrix" values="0 0 0 0 .85 0 0 0 0 .8 0 0 0 0 .7 0 0 0 .08 0"/></filter>
+<filter id="fibres"><feTurbulence type="fractalNoise" baseFrequency=".018 .95" numOctaves="2" seed="4" result="strands"/><feTurbulence baseFrequency=".012 .8" seed="6" result="bend"/><feDisplacementMap in="strands" in2="bend" scale="8"/><feColorMatrix type="saturate" values="0"/><feComponentTransfer><feFuncA type="discrete" tableValues="0 0 0 0 .04"/></feComponentTransfer></filter>
+<filter id="white-fibres"><feTurbulence type="fractalNoise" baseFrequency=".012 .8" numOctaves="2" seed="7"/><feColorMatrix type="matrix" values="0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 1 0"/><feComponentTransfer><feFuncA type="discrete" tableValues="0 0 0 0 .04"/></feComponentTransfer></filter>
+<filter id="specks"><feTurbulence baseFrequency=".45" seed="3"/><feColorMatrix type="matrix" values="0 0 0 0 .2 0 0 0 0 .15 0 0 0 0 .1 0 0 0 1 0"/><feComponentTransfer><feFuncA type="discrete" tableValues="0 0 0 0 0 0 0 .04"/></feComponentTransfer></filter>
+</defs>
+<path class="light-mottle" d="M0 0H800V800H0Z" filter="url(#mottle)"/><path class="dark-mottle" d="M0 0H800V800H0Z" filter="url(#dark-mottle)"/><path d="M0 0H800V800H0Z" filter="url(#tooth)"/><path d="M0 0H800V800H0Z" filter="url(#fibres)"/><path d="M0 0H800V800H0Z" filter="url(#white-fibres)"/><path d="M0 0H800V800H0Z" filter="url(#specks)"/>
+</svg>
