@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Pressed card visibility check</title>
+<body>
+<p id="result">Running…</p>
+<script type="module">
+  // Run with npm run dev, then open /tests/press-preview.html.
+  import { mount, tick, unmount } from 'svelte';
+  import PressCard from '../src/lib/PressCard.svelte';
+  import { makeCard } from '../src/lib/press.ts';
+  import '../src/app.css';
+  import '@fontsource-variable/alegreya';
+  import '@fontsource/ibm-plex-mono/400.css';
+  const result = document.querySelector('#result');
+  const card = makeCard(['A little light remains.'], { date: '2026-09-13', start: '2026-09-13T08:13:00+01:00', label: '' });
+  let hidden = true, component;
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+  const animations = () => document.querySelector('dialog').getAnimations({ subtree: true });
+  const check = (condition, message) => { if (!condition) throw new Error(message); };
+  try {
+    component = mount(PressCard, { target: document.body, props: { card, onclose() {} } });
+    await tick();
+    check(animations().length === 0, 'Hidden opening must not depend on an animation timeline.');
+    await unmount(component);
+    hidden = false;
+    component = mount(PressCard, { target: document.body, props: { card, onclose() {} } });
+    await tick();
+    check(animations().length === 2, 'Visible opening must retain both entrance animations.');
+    hidden = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await tick();
+    check(animations().length === 0, 'Hiding must release both animated layers.');
+    hidden = false;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await tick();
+    check(animations().length === 0, 'Returning must not replay the entrance.');
+    result.textContent = 'PASS: hidden opening, visible opening, interruption, and return.';
+  } catch (error) {
+    result.textContent = `FAIL: ${error.message}`;
+  } finally {
+    if (component) await unmount(component);
+    delete document.hidden;
+  }
+</script>
+</body>
+</html>

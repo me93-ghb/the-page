@@ -84,7 +84,11 @@ in recovery. If recovery also fails, their bytes remain in memory for retry.
 
 This version implements writing, resume, session folds, journal-day transitions,
 continuous history, templates, labels, photographs, recovery, and conflict copies.
-Card exports are not implemented yet.
+Select writing and press Command-Shift-P (File > Press Line…) to compose a card.
+Save Image… writes a 1200×2000 PNG; Copy puts the same image on the clipboard.
+Cards include the page date, initial time, and label. Selections over 160 characters
+are shortened at a word boundary, with a visible notice. Escape closes the card
+and restores the selection; exporting leaves the journal unchanged.
 The app uses bundled fonts and makes no network requests. Folder syncing is external.
 
 Alegreya and IBM Plex Mono ship under the SIL Open Font License; the notices are in

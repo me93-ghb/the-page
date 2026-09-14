@@ -227,6 +227,26 @@ async fn save_copy(app: tauri::AppHandle, date: String, id: String, base: Option
 }
 
 #[tauri::command]
+async fn export_card(app: tauri::AppHandle, bytes: Vec<u8>, copy: bool, date: String) -> Result<bool, String> {
+    the_page::press::validate(&bytes)?;
+    if copy {
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+        use objc2_foundation::NSData;
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let data = NSData::with_bytes(&bytes);
+        pasteboard.clearContents();
+        // SAFETY: AppKit supplies the static PNG pasteboard type; NSData owns the validated bytes.
+        if !pasteboard.setData_forType(Some(&data), unsafe { NSPasteboardTypePNG }) { return Err("The system clipboard could not accept this image.".into()); }
+        return Ok(true);
+    }
+    let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?;
+    let picker = app.clone();
+    let choice = tauri::async_runtime::spawn_blocking(move || picker.dialog().file().set_title("Save pressed card").add_filter("PNG image", &["png"]).set_file_name(format!("{date}-pressed.png")).blocking_save_file()).await.map_err(|e| e.to_string())?;
+    let destination = choice.map(|choice| choice.into_path().map_err(|e| e.to_string())).transpose()?;
+    the_page::press::save(&bytes, destination.as_deref())
+}
+
+#[tauri::command]
 fn exit_now(app: tauri::AppHandle, state: tauri::State<'_, Mutex<Session>>) {
     if let Ok(mut state) = state.lock() {
         state.allow_exit = true;
@@ -250,7 +270,8 @@ fn main() {
             save_copy,
             store_photograph,
             read_photograph,
-            exit_now
+            exit_now,
+            export_card
         ])
         .setup(|app| {
             let save = MenuItem::with_id(app, "save", "Save Now", true, Some("CmdOrCtrl+S"))?;
@@ -267,7 +288,8 @@ fn main() {
                 ],
             )?;
             let copy = MenuItem::with_id(app, "save-copy", "Save a Copy…", true, None::<&str>)?;
-            let file = Submenu::with_items(app, "File", true, &[&save, &copy, &reveal])?;
+            let press = MenuItem::with_id(app, "press", "Press Line…", true, Some("CmdOrCtrl+Shift+P"))?;
+            let file = Submenu::with_items(app, "File", true, &[&save, &copy, &press, &reveal])?;
             let edit = Submenu::with_items(
                 app,
                 "Edit",
@@ -310,6 +332,7 @@ fn main() {
             "today" | "previous" | "next" => {
                 let _ = app.emit("navigate-requested", event.id().as_ref());
             }
+            "press" => { let _ = app.emit("press-requested", ()); }
             "label" => { let _ = app.emit("label-requested", ()); }
             "save-copy" => { let _ = app.emit("save-copy-requested", ()); }
             "save" => {

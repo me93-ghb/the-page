@@ -7,6 +7,10 @@
   import { createEditor, editorSnapshot, refreshFolds, pendingEndInput, transferEndInput, templates, insertTemplate, stagePhotograph, photographCopy } from './lib/editor';
   import { Flow, gapNote, historyBatch, historyGap } from './lib/flow';
   import { persistPages } from './lib/persistence';
+  import PressCard from './lib/PressCard.svelte';
+  import { makeCard } from './lib/press';
+  import type { Card } from './lib/press';
+  import type { EditorSelection } from '@codemirror/state';
   import type { SaveResult } from './lib/persistence';
   import type { PendingInput, PendingImageData, PendingPhotograph } from './lib/editor';
   import { journalDay, sessionTime, inputPlan, timestamp } from './lib/journal';
@@ -20,6 +24,7 @@
   let closeDialog = $state<HTMLDialogElement>();
   let loading = $state(true), notice = $state(''), closing = $state(false), now = $state(new Date());
   let focused: OpenPage | undefined;
+  let pressed = $state.raw<{ card: Card; editor: EditorView; selection: EditorSelection } | null>(null);
   let pendingImages = $state.raw<{ page: OpenPage; pending: PendingPhotograph }[]>([]);
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let importing = 0;
@@ -89,6 +94,7 @@
     finally { batching = false; }
   }
   async function navigate(command: string) {
+    if (pressed) return;
     if (!flow) return;
     if (transfer) { await finishTransfer(); if (transfer) return; }
     try {
@@ -225,6 +231,7 @@
     }
   }
   function editLabel(page = focused ?? pages.find(page => page.date === activeDate)) {
+    if (pressed) return;
     if (!page || page.error) return;
     page.labelEditing = true;
   }
@@ -350,6 +357,7 @@
     return saving;
   }
   async function saveCopy() {
+    if (pressed) return;
     const page = focused ?? pages.find(page => page.date === activeDate);
     if (!page || page.error) return;
     try {
@@ -381,6 +389,25 @@
     try { await refreshCleanPages(); if (!indexed) await indexPages(); }
     catch (error) { notice = `Cannot check the journal. ${String(error)}`; }
   }
+  function pressLine() {
+    if (pressed || closing || document.activeElement instanceof HTMLInputElement) return;
+    const page = focused, editor = page?.editor;
+    if (!page || !editor || page.error || editor.state.selection.main.empty) return;
+    try {
+      const selection = editor.state.selection, range = selection.main;
+      const snapshot = editorSnapshot(editor);
+      const sections = snapshot.sessions.length ? snapshot.sessions.map(session => session.content) : [snapshot.content];
+      const card = makeCard(sections, { date: page.date, start: page.sessions[0]?.start ?? page.created ?? '', label: page.label }, range);
+      if (card) { flow?.interrupt(); pressed = { card, editor, selection }; }
+    } catch (error) { notice = `Cannot press this selection. ${String(error)}`; }
+  }
+  async function closePress() {
+    const previous = pressed; pressed = null;
+    await tick();
+    if (previous?.editor.dom.isConnected) {
+      previous.editor.focus(); previous.editor.dispatch({ selection: previous.selection });
+    }
+  }
   async function requestExit() {
     if (transfer) await finishTransfer();
     if (await save()) await invoke('exit_now'); else closing = true;
@@ -390,7 +417,7 @@
 
   onMount(() => {
     const activate = async () => {
-      if (loading || closing || !pages.length) return;
+      if (loading || closing || pressed || !pages.length) return;
       flow?.interrupt();
       try { await save(); await refreshCleanPages(); }
       catch (error) { notice = `Cannot check external changes. ${String(error)}`; }
@@ -399,9 +426,11 @@
     };
     const listeners = [
       listen<string>('edit-requested', event => {
+        if (pressed) return;
         if (document.activeElement instanceof HTMLInputElement) document.execCommand(event.payload);
         else if (focused?.editor) (event.payload === 'undo' ? undo : redo)(focused.editor);
       }),
+      listen('press-requested', pressLine),
       listen('label-requested', () => editLabel()),
       listen('save-requested', () => void save()),
       listen('save-copy-requested', () => void saveCopy()),
@@ -416,6 +445,8 @@
     window.addEventListener('blur', save);
     const clock = setInterval(() => now = new Date(), 1000);
     const keydown = (event: KeyboardEvent) => {
+      if (pressed) return;
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'p') { event.preventDefault(); event.stopPropagation(); pressLine(); return; }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 't') { event.preventDefault(); event.stopPropagation(); void navigate('today'); return; }
       if ((event.metaKey || event.ctrlKey) && event.altKey && ['ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); event.stopPropagation(); void navigate(event.key === 'ArrowUp' ? 'previous' : 'next'); return; }
       if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'l') { event.preventDefault(); editLabel(); return; }
@@ -428,6 +459,7 @@
   });
 </script>
 
+{#if pressed}<PressCard card={pressed.card} onclose={closePress} />{/if}
 <div class="sheet">
   <div class="titlebar" data-tauri-drag-region></div>
   {#if pages.length}
