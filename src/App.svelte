@@ -8,6 +8,7 @@
   import { Flow, gapNote, historyBatch, historyGap } from './lib/flow';
   import { persistPages } from './lib/persistence';
   import PressCard from './lib/PressCard.svelte';
+  import Appearance from './lib/Appearance.svelte';
   import { makeCard } from './lib/press';
   import type { Card } from './lib/press';
   import type { EditorSelection } from '@codemirror/state';
@@ -462,6 +463,7 @@
 {#if pressed}<PressCard card={pressed.card} onclose={closePress} />{/if}
 <div class="sheet">
   <div class="titlebar" data-tauri-drag-region></div>
+  <Appearance onerror={message => { notice = message; }} />
   {#if pages.length}
     <main class="flow" aria-label="Journal" bind:this={root}>
       <div class="flow-content" bind:this={content}>

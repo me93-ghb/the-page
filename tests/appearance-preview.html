@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Appearance check</title>
+<body>
+<p id="result">Running…</p>
+<script type="module">
+  // Run with npm run dev, then open /tests/appearance-preview.html.
+  import { mount, unmount } from 'svelte';
+  import { mockIPC, mockWindows, clearMocks } from '@tauri-apps/api/mocks';
+  import Appearance from '../src/lib/Appearance.svelte';
+  const result = document.querySelector('#result'), saved = localStorage.getItem('appearance');
+  const calls = [];
+  let component, failure = false, message = '';
+  const settled = () => new Promise(resolve => setTimeout(resolve, 0));
+  const check = (condition, text) => { if (!condition) throw new Error(text); };
+  mockWindows('main');
+  mockIPC((command, args) => {
+    check(command === 'plugin:window|set_theme', 'Only the native theme command is expected.');
+    if (failure) throw new Error('Theme unavailable');
+    calls.push(args.value);
+  });
+  try {
+    localStorage.setItem('appearance', 'light');
+    component = mount(Appearance, { target: document.body, props: { onerror: text => { message = text; } } });
+    await settled();
+    check(calls.at(-1) === 'light', 'Restore the saved native appearance.');
+    document.querySelector('[aria-label="Dark appearance"]').click();
+    await settled();
+    check(calls.at(-1) === 'dark' && localStorage.getItem('appearance') === 'dark', 'Apply and remember dark appearance.');
+    check(document.querySelector('[aria-label="Dark appearance"]').getAttribute('aria-pressed') === 'true', 'Expose the selected appearance.');
+    failure = true;
+    document.querySelector('[aria-label="Light appearance"]').click();
+    await settled();
+    check(message.includes('Theme unavailable') && localStorage.getItem('appearance') === 'dark', 'Report failure and retain the last applied preference.');
+    check(!document.querySelector('button').disabled, 'Allow retry after failure.');
+    result.textContent = 'PASS: restore, native switch, saved choice, accessible state, and failure/retry.';
+  } catch (error) { result.textContent = `FAIL: ${error.message}`; }
+  finally {
+    if (component) await unmount(component);
+    if (saved === null) localStorage.removeItem('appearance'); else localStorage.setItem('appearance', saved);
+    clearMocks();
+  }
+</script>
+</body>
+</html>

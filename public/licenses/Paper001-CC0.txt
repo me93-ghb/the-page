@@ -1,0 +1,12 @@
+Paper 001 by ambientCG
+https://ambientcg.com/view?id=Paper001
+
+Source: Paper001_4K-JPG.zip, Paper001_4K-JPG_Color.jpg (unmodified).
+Local asset: textures/paper-001.jpg.
+
+Released under Creative Commons CC0 1.0 Universal:
+https://creativecommons.org/publicdomain/zero/1.0/
+
+ambientCG confirms that CC0 applies to its downloadable assets, including
+redistribution of raw files in an application:
+https://docs.ambientcg.com/license/
