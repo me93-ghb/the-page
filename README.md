@@ -4,6 +4,8 @@ A daily journal for macOS on Apple Silicon, for people who want a page to write 
 Open it to today's writing. Scroll up to read earlier days. Your writing lives in
 Markdown files in a folder you choose.
 
+![The Page in light mode, with textured paper, a dated margin, and sample journal writing.](docs/images/the-page.jpg)
+
 Write `**A quiet afternoon.**` and the formatting appears as you type. Come back
 after a break and a timestamped fold marks where you began again.
 
