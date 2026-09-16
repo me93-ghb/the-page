@@ -465,7 +465,8 @@
   <div class="titlebar" data-tauri-drag-region></div>
   <Appearance onerror={message => { notice = message; }} />
   {#if pages.length}
-    <main class="flow" aria-label="Journal" bind:this={root}>
+    <main class="flow" aria-label="Journal" bind:this={root}
+      onscroll={event => event.currentTarget.parentElement!.style.setProperty('--paper-offset', `${-event.currentTarget.scrollTop}px`)}>
       <div class="flow-content" bind:this={content}>
       {#if indexed && !older.length}
         <div class="first-page"><span>THE FIRST PAGE</span><time>{dateLabel(pages[0])}</time></div>
